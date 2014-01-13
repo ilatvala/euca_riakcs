@@ -1,0 +1,246 @@
+# ----------------------------------------------------- 
+# This playbook is an example for deploying a riak cs servers in eucalyptus
+# Author: Ilpo Latvala, 9.1.2014
+# -----------------------------------------------------
+
+- name: Stage riakcs instance(s)
+  hosts: localhost
+  connection: local
+  user: root
+  gather_facts: false
+
+  vars:
+      keypair: riakcs
+      instance_type: m1.medium
+      security_group: default
+      image: emi-26B340F4
+
+  tasks:
+    - name: Launch instances
+      local_action: ec2 keypair={{keypair}} group={{security_group}} instance_type={{instance_type}} instance_tags='{"type":"riakcs"}' image={{image}} wait=true count=5
+      register: ec2
+
+    - name: Add new instance to host group
+      local_action: add_host hostname={{ item.public_ip }} groupname=riakinstances
+      with_items: ec2.instances
+
+    - name: Wait for SSH to come up
+      local_action: wait_for host={{ item.public_ip }} port=22 delay=5 timeout=320 state=started
+      with_items: ec2.instances
+
+- name: Configure instances
+  hosts: riakinstances
+  user: root
+  gather_facts: True
+
+  tasks:
+    - name: Get ephemeral path
+      shell: "df -h | grep vda2 | awk '{print $6}'"
+      register: ephemeral
+
+    - name: Ensure required packeges are installed
+      yum: name={{ item }} state=installed
+      with_items:
+      - sudo
+      - curl
+      - sed
+
+    - name: Install Basho release for Centos 6
+      yum: name=http://yum.basho.com/gpg/basho-release-6-1.noarch.rpm state=installed
+
+    - name: Install Basho packages
+      yum: name={{ item }} state=installed
+      with_items:
+      - riak
+      - riak-cs
+      - stanchion
+
+    - name: Make ephemeral subdirectories
+      shell: "mkdir {{ephemeral.stdout}}/{{item}}"
+      with_items:
+      - leveldb
+      - bitcask
+
+    - name: Change ephemeral ownership
+      shell: "chown -R riak.riak {{ephemeral.stdout}}/{{item}}"
+      with_items:
+      - leveldb
+      - bitcask
+
+    - name: Get network ip
+      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
+      register: ipaddr
+
+    - name: Edit app.config files IP
+      shell: sed -i "s/127.0.0.1/{{ipaddr.stdout}}/g" /etc/{{item}}/app.config
+      with_items:
+      - riak
+      - riak-cs
+      - stanchion
+
+    - name: Edit vm.args files IP
+      shell: sed -i "s/127.0.0.1/{{ipaddr.stdout}}/g" /etc/{{item}}/vm.args
+      with_items:
+      - riak
+      - riak-cs
+      - stanchion
+
+    - name: Add the line for bucket properties
+      lineinfile: dest=/etc/riak/app.config
+                  insertafter='\{riak_core, \['
+                  line='              {default_bucket_props, [{allow_mult, true}]},'
+
+    - name: Remove bitcask line
+      lineinfile: dest=/etc/riak/app.config
+                  regexp='\{storage_backend, riak_kv_bitcask_backend\},'
+                  state=absent
+
+    - name: Add riak-cs backend
+      lineinfile: dest=/etc/riak/app.config insertafter="\{riak_kv, \[" line='{{item}}'
+      with_items:
+        - '             ] },'
+        - '              ]}'
+        - '                  {data_root, "{{ephemeral.stdout}}/bitcask"}'
+        - '                {be_blocks, riak_kv_bitcask_backend, ['
+        - '              ]},'
+        - '                  {data_root, "{{ephemeral.stdout}}/leveldb"}'
+        - '                {max_open_files, 50},'
+        - '              {be_default, riak_kv_eleveldb_backend, ['
+        - '            {multi_backend, ['
+        - '            {multi_backend_default, be_default},'
+        - '            {multi_backend_prefix_list, [{<<"0b:">>, be_blocks}]},'
+        - '            {storage_backend, riak_cs_kv_multi_backend},'
+        - '            {add_paths, ["/usr/lib64/riak-cs/lib/riak_cs-1.4.3/ebin"]},'
+
+    - name: Comment out requitetty
+      lineinfile: dest=/etc/sudoers regexp='^Defaults *requiretty' line='# Defaults requiretty'
+
+    - name: Set soft limits
+      lineinfile: dest=/etc/security/limits.conf insertafter=EOF line='{{item}} soft nofile 65536'
+      with_items:
+      - riak
+      - riak-cs
+      - stanchion
+      - root
+
+    - name: Set hard limits
+      lineinfile: dest=/etc/security/limits.conf insertafter=EOF line='{{item}} hard nofile 65536'
+      with_items:
+      - riak
+      - riak-cs
+      - stanchion
+      - root
+
+    - name: Start Basho packages
+      shell: "{{item}} start"
+      with_items:
+      - riak
+      - stanchion
+      - riak-cs
+
+- name: Configure admin user on first instance only
+  hosts: riakinstances[0]
+  user: root
+  gather_facts: True
+
+  vars:
+      adminuser: "admin"
+      email: "my.name@example.com"
+
+  tasks:
+    - name: Get network ip
+      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
+      register: ipaddr
+
+    - name: Add anonympus user creation to first instance
+      lineinfile: dest=/etc/riak-cs/app.config
+                  insertbefore='\{cs_ip,'
+                  line='              {anonymous_user_creation, true},'
+
+    - name: restart riak-cs services
+      shell: riak-cs restart
+
+    - name: Wait for port 8080
+      wait_for: host={{ipaddr.stdout}} port=8080 state=started
+
+    - name: Pause a bit
+      pause: seconds=30
+
+    - name: Make admin user
+      shell: "curl -H 'Content-Type:application/json' -X POST http://{{ipaddr.stdout}}:8080/riak-cs/user --data '{\"email\":\"{{email}}\", \"name\":\"{{adminuser}}\"}'"
+      register: useroutput
+
+    - name: output all
+      debug: msg={{useroutput.stdout}}
+
+    - name: Find access key
+      shell: "echo {{useroutput.stdout}} | cut -d: -f 5 | awk '{print $1}'"
+      register: key_id
+
+    - name: Find secret key
+      shell: "echo {{useroutput.stdout}} | cut -d: -f 6 | awk '{print $1}'"
+      register: key_secret
+
+    - name: Insert access key
+      shell: sed -i "s/admin-key/{{key_id.stdout}}/g" /etc/{{item}}/app.config
+      with_items:
+        - riak-cs
+        - stanchion
+
+    - name: Insert secret key
+      shell: sed -i "s/admin-secret/{{key_secret.stdout}}/g" /etc/{{item}}/app.config
+      with_items:
+        - riak-cs
+        - stanchion
+
+    - name: Remove bitcask line
+      lineinfile: dest=/etc/riak-cs/app.config
+                  regexp='\{anonymous_user_creation, true\},'
+                  state=absent
+
+    - name: Restart Basho packages
+      shell: "{{item}} restart"
+      with_items:
+      - stanchion
+      - riak-cs
+
+- name: Join additional nodes
+  hosts: riakinstances[1-5]
+  user: root
+  gather_facts: True
+
+  tasks:
+    - name: Get first node private IP
+      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
+      delegate_to: "{{groups.riakinstances[0]}}"
+      register: firstip
+
+    - name: Register nodes
+      shell: "riak-admin cluster join riak@{{firstip.stdout}}"
+
+- name: Final commands on first node
+  hosts: riakinstances[0]
+  user: root
+  gather_facts: True
+
+  tasks:
+    - name: Verify cluster plan
+      shell: "riak-admin cluster plan"
+
+    - name: Commit cluster plan
+      shell: "riak-admin cluster commit"
+
+    - name: Get access key
+      shell: "grep admin_key /etc/riak-cs/app.config"
+      register: adminkey
+
+    - name: Get secret key
+      shell: "grep admin_secret /etc/riak-cs/app.config"
+      register: adminsecret
+
+    - name: Print info
+      debug: msg="Connection details for riak-cs:"
+
+    - debug: msg="s3://{{groups.riakinstances[0]}}:8080"
+    - debug: msg="{{adminkey.stdout}}"
+    - debug: msg="{{adminsecret.stdout}}"
