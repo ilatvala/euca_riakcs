@@ -1,5 +1,5 @@
 # ----------------------------------------------------- 
-# This playbook is an example for deploying a riak cs servers in eucalyptus
+# This playbook is an example for deploying 5 riak cs servers in eucalyptus instances
 # Author: Ilpo Latvala, 9.1.2014
 # -----------------------------------------------------
 
