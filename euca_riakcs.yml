@@ -193,7 +193,7 @@
         - riak-cs
         - stanchion
 
-    - name: Remove bitcask line
+    - name: Remove anonymous line
       lineinfile: dest=/etc/riak-cs/app.config
                   regexp='\{anonymous_user_creation, true\},'
                   state=absent
