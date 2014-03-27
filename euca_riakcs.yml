@@ -14,10 +14,11 @@
       instance_type: m1.medium
       security_group: default
       image: emi-26B340F4
+      imagecount: 5
 
   tasks:
     - name: Launch instances
-      local_action: ec2 keypair={{keypair}} group={{security_group}} instance_type={{instance_type}} instance_tags='{"type":"riakcs"}' image={{image}} wait=true count=5
+      local_action: ec2 keypair={{keypair}} group={{security_group}} instance_type={{instance_type}} instance_tags='{"type":"riakcs"}' image={{image}} wait=true count={{imagecount}}
       register: ec2
 
     - name: Add new instance to host group
@@ -67,25 +68,21 @@
       - leveldb
       - bitcask
 
-    - name: Get network ip
-      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
-      register: ipaddr
-
     - name: Edit app.config files IP
-      shell: sed -i "s/127.0.0.1/{{ipaddr.stdout}}/g" /etc/{{item}}/app.config
+      shell: sed -i "s/127.0.0.1/{{hostvars[inventory_hostname].ansible_eth0.ipv4.address}}/g" /etc/{{item}}/app.config
       with_items:
       - riak
       - riak-cs
       - stanchion
 
     - name: Edit vm.args files IP
-      shell: sed -i "s/127.0.0.1/{{ipaddr.stdout}}/g" /etc/{{item}}/vm.args
+      shell: sed -i "s/127.0.0.1/{{hostvars[inventory_hostname].ansible_eth0.ipv4.address}}/g" /etc/{{item}}/vm.args
       with_items:
       - riak
       - riak-cs
       - stanchion
 
-    - name: Add the line for bucket properties
+    - name: Add a line for bucket properties
       lineinfile: dest=/etc/riak/app.config
                   insertafter='\{riak_core, \['
                   line='              {default_bucket_props, [{allow_mult, true}]},'
@@ -94,6 +91,10 @@
       lineinfile: dest=/etc/riak/app.config
                   regexp='\{storage_backend, riak_kv_bitcask_backend\},'
                   state=absent
+
+    - name: Find riak_cs lib path
+      shell: "ls /usr/lib64/riak-cs/lib/ | grep riak_cs"
+      register: riakcslib
 
     - name: Add riak-cs backend
       lineinfile: dest=/etc/riak/app.config insertafter="\{riak_kv, \[" line='{{item}}'
@@ -110,7 +111,7 @@
         - '            {multi_backend_default, be_default},'
         - '            {multi_backend_prefix_list, [{<<"0b:">>, be_blocks}]},'
         - '            {storage_backend, riak_cs_kv_multi_backend},'
-        - '            {add_paths, ["/usr/lib64/riak-cs/lib/riak_cs-1.4.3/ebin"]},'
+        - '            {add_paths, ["/usr/lib64/riak-cs/lib/{{riakcslib.stdout}}/ebin"]},'
 
     - name: Comment out requitetty
       lineinfile: dest=/etc/sudoers regexp='^Defaults *requiretty' line='# Defaults requiretty'
@@ -148,10 +149,6 @@
       email: "my.name@example.com"
 
   tasks:
-    - name: Get network ip
-      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
-      register: ipaddr
-
     - name: Add anonympus user creation to first instance
       lineinfile: dest=/etc/riak-cs/app.config
                   insertbefore='\{cs_ip,'
@@ -161,17 +158,14 @@
       shell: riak-cs restart
 
     - name: Wait for port 8080
-      wait_for: host={{ipaddr.stdout}} port=8080 state=started
+      wait_for: host={{hostvars[inventory_hostname].ansible_eth0.ipv4.address}} port=8080 state=started
 
     - name: Pause a bit
       pause: seconds=30
 
     - name: Make admin user
-      shell: "curl -H 'Content-Type:application/json' -X POST http://{{ipaddr.stdout}}:8080/riak-cs/user --data '{\"email\":\"{{email}}\", \"name\":\"{{adminuser}}\"}'"
+      shell: "curl -H 'Content-Type:application/json' -X POST http://{{hostvars[inventory_hostname].ansible_eth0.ipv4.address}}:8080/riak-cs/user --data '{\"email\":\"{{email}}\", \"name\":\"{{adminuser}}\"}'"
       register: useroutput
-
-    - name: output all
-      debug: msg={{useroutput.stdout}}
 
     - name: Find access key
       shell: "echo {{useroutput.stdout}} | cut -d: -f 5 | awk '{print $1}'"
@@ -193,7 +187,7 @@
         - riak-cs
         - stanchion
 
-    - name: Remove anonymous line
+    - name: Remove bitcask line
       lineinfile: dest=/etc/riak-cs/app.config
                   regexp='\{anonymous_user_creation, true\},'
                   state=absent
@@ -205,18 +199,14 @@
       - riak-cs
 
 - name: Join additional nodes
-  hosts: riakinstances[1-5]
+  hosts: riakinstances
   user: root
   gather_facts: True
 
   tasks:
-    - name: Get first node private IP
-      shell: "ifconfig eth0 | grep 'inet addr' | awk '{ print substr($2,6) }'"
-      delegate_to: "{{groups.riakinstances[0]}}"
-      register: firstip
-
     - name: Register nodes
-      shell: "riak-admin cluster join riak@{{firstip.stdout}}"
+      shell: "riak-admin cluster join riak@{{hostvars[groups.riakinstances[0]].ansible_eth0.ipv4.address}}"
+      when: inventory_hostname != groups.riakinstances[0]
 
 - name: Final commands on first node
   hosts: riakinstances[0]
@@ -238,9 +228,14 @@
       shell: "grep admin_secret /etc/riak-cs/app.config"
       register: adminsecret
 
-    - name: Print info
-      debug: msg="Connection details for riak-cs:"
+    - name: Get cluster members
+      shell: "riak-admin member-status"
+      register: members
 
-    - debug: msg="s3://{{groups.riakinstances[0]}}:8080"
+    - name: Print cluster members
+      debug: var=members.stdout_lines
+
+    - debug: msg="http://{{groups.riakinstances[0]}}:8080"
     - debug: msg="{{adminkey.stdout}}"
     - debug: msg="{{adminsecret.stdout}}"
+    
